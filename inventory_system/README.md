@@ -2,153 +2,72 @@
 require 'config.php';
 session_start();
 
-if (isset($_SESSION['user_id'])) {
-    header('Location: dashboard.php');
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
     exit();
 }
 
-$error = '';
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = trim($_POST['username'] ?? '');
-    $password = $_POST['password'] ?? '';
-
-    if ($username === '' || $password === '') {
-        $error = 'Username and password are required.';
-    } else {
-        $stmt = $pdo->prepare('SELECT * FROM users WHERE username = ? OR email = ?');
-        $stmt->execute([$username, $username]);
-        $user = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        if ($user && password_verify($password, $user['password'])) {
-            $_SESSION['user_id'] = $user['id'];
-            $_SESSION['username'] = $user['username'];
-            $_SESSION['role'] = $user['role'];
-            header('Location: dashboard.php');
-            exit();
-        } else {
-            $error = 'Invalid username or password.';
-        }
-    }
-}
+$rows = $pdo->query("SELECT p.name, p.sku, p.category, s.name AS supplier_name, p.price,
+    COALESCE(SUM(CASE WHEN st.type = 'IN' THEN st.quantity ELSE -st.quantity END), 0) AS stock
+    FROM products p
+    LEFT JOIN suppliers s ON s.id = p.supplier_id
+    LEFT JOIN stock_transactions st ON st.product_id = p.id
+    GROUP BY p.id, p.name, p.sku, p.category, s.name, p.price
+    ORDER BY p.name ASC")->fetchAll(PDO::FETCH_ASSOC);
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login | Inventory Pro</title>
+    <title>Inventory PDF Export</title>
     <style>
-        :root {
-            --bg1: #eff6ff;
-            --bg2: #f8fafc;
-            --primary: #2563eb;
-            --primary-dark: #1d4ed8;
-            --card: rgba(255,255,255,0.9);
-            --line: #dbe3f0;
-            --text: #0f172a;
-            --muted: #64748b;
-            --error-bg: #fee2e2;
-            --error-text: #991b1b;
-        }
-
-        * { box-sizing: border-box; }
-
-        body {
-            margin: 0;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-family: Arial, sans-serif;
-            background: linear-gradient(135deg, var(--bg1) 0%, var(--bg2) 100%);
-            color: var(--text);
-            padding: 24px;
-        }
-
-        .auth-card {
-            width: 100%;
-            max-width: 420px;
-            background: var(--card);
-            border: 1px solid var(--line);
-            border-radius: 24px;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
-            padding: 30px;
-        }
-
-        .logo {
-            text-align: center;
-            margin-bottom: 12px;
-            font-size: 1.8rem;
-            font-weight: 700;
-        }
-
-        h2 {
-            text-align: center;
-            margin: 0 0 16px;
-        }
-
-        .error {
-            background: var(--error-bg);
-            color: var(--error-text);
-            border-radius: 10px;
-            padding: 12px 14px;
-            margin-bottom: 16px;
-            font-weight: 600;
-        }
-
-        form {
-            display: grid;
-            gap: 12px;
-        }
-
-        input, button {
-            width: 100%;
-            padding: 12px 14px;
-            border-radius: 12px;
-            border: 1px solid var(--line);
-            font-size: 14px;
-        }
-
-        button {
-            border: none;
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
-            color: white;
-            font-weight: 700;
-            cursor: pointer;
-        }
-
-        .link {
-            text-align: center;
-            margin-top: 16px;
-        }
-
-        .link a {
-            color: var(--primary);
-            text-decoration: none;
-            font-weight: 700;
+        body { font-family: Arial, sans-serif; color: #0f172a; margin: 30px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        th { background: #f1f5f9; }
+        h1 { margin-bottom: 0; }
+        .meta { color: #64748b; margin-bottom: 18px; }
+        @media print {
+            body { margin: 0; }
+            button { display: none; }
         }
     </style>
 </head>
 <body>
-    <div class="auth-card">
-        <div class="logo">Inventory Pro</div>
-        <h2>Login</h2>
+    <h1>Inventory Report</h1>
+    <div class="meta">Generated on <?php echo date('Y-m-d H:i:s'); ?></div>
 
-        <?php if ($error !== ''): ?>
-            <div class="error"><?php echo htmlspecialchars($error); ?></div>
-        <?php endif; ?>
+    <table>
+        <thead>
+            <tr>
+                <th>Product</th>
+                <th>SKU</th>
+                <th>Category</th>
+                <th>Supplier</th>
+                <th>Price</th>
+                <th>Stock</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php if (!empty($rows)): ?>
+                <?php foreach ($rows as $row): ?>
+                    <tr>
+                        <td><?php echo htmlspecialchars($row['name']); ?></td>
+                        <td><?php echo htmlspecialchars($row['sku']); ?></td>
+                        <td><?php echo htmlspecialchars($row['category'] ?: '-'); ?></td>
+                        <td><?php echo htmlspecialchars($row['supplier_name'] ?: '-'); ?></td>
+                        <td>$<?php echo number_format((float)$row['price'], 2); ?></td>
+                        <td><?php echo (int)$row['stock']; ?></td>
+                    </tr>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <tr><td colspan="6">No products available.</td></tr>
+            <?php endif; ?>
+        </tbody>
+    </table>
 
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username or Email" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Sign In</button>
-        </form>
-
-        <div class="link">
-            <a href="register.php">Need an account? Register</a>
-        </div>
+    <div style="margin-top: 20px;">
+        <button onclick="window.print()">Print / Save as PDF</button>
     </div>
 </body>
 </html>

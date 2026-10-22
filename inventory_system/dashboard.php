@@ -22,8 +22,9 @@ $where = [];
 $params = [];
 
 if ($search !== '') {
-    $where[] = '(p.name LIKE ? OR p.sku LIKE ? OR p.category LIKE ?)';
+    $where[] = '(p.name LIKE ? OR p.sku LIKE ? OR p.category LIKE ? OR s.name LIKE ?)';
     $like = "%$search%";
+    $params[] = $like;
     $params[] = $like;
     $params[] = $like;
     $params[] = $like;
@@ -35,17 +36,19 @@ if ($categoryFilter !== '') {
 }
 
 $sql = "
-    SELECT p.id, p.name, p.sku, p.category, p.price,
+    SELECT p.id, p.name, p.sku, p.category, p.price, p.image,
+           s.name AS supplier_name,
            COALESCE(SUM(CASE WHEN st.type = 'IN' THEN st.quantity ELSE -st.quantity END), 0) AS stock
     FROM products p
     LEFT JOIN stock_transactions st ON st.product_id = p.id
+    LEFT JOIN suppliers s ON s.id = p.supplier_id
 ";
 
 if (!empty($where)) {
     $sql .= ' WHERE ' . implode(' AND ', $where);
 }
 
-$sql .= ' GROUP BY p.id, p.name, p.sku, p.category, p.price';
+$sql .= ' GROUP BY p.id, p.name, p.sku, p.category, p.price, p.image, s.name';
 
 if ($stockFilter === 'low') {
     $sql .= ' HAVING stock <= 5';
@@ -61,7 +64,34 @@ $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+$suppliers = $pdo->query('SELECT id, name FROM suppliers ORDER BY name ASC')->fetchAll(PDO::FETCH_ASSOC);
 $categoryList = $pdo->query("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category <> '' ORDER BY category ASC")->fetchAll(PDO::FETCH_COLUMN);
+
+function uploadProductPhoto(array $file): ?string {
+    if (!isset($file['name']) || $file['name'] === '') {
+        return null;
+    }
+
+    $uploadDir = __DIR__ . '/uploads';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0777, true);
+    }
+
+    $allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (!in_array($file['type'], $allowed, true)) {
+        return null;
+    }
+
+    $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
+    $filename = uniqid('prod_', true) . '.' . strtolower($ext);
+    $target = $uploadDir . '/' . $filename;
+
+    if (move_uploaded_file($file['tmp_name'], $target)) {
+        return $filename;
+    }
+
+    return null;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
@@ -77,6 +107,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $sku = trim($_POST['sku'] ?? '');
             $category = trim($_POST['category'] ?? '');
             $price = trim($_POST['price'] ?? '0');
+            $supplierId = $_POST['supplier_id'] ?? null;
+            $photoName = uploadProductPhoto($_FILES['photo'] ?? ['name' => '']);
 
             if ($name === '' || $sku === '') {
                 header('Location: inventory.php?error=missing_fields');
@@ -84,8 +116,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             try {
-                $insert = $pdo->prepare('INSERT INTO products (name, sku, category, price) VALUES (?, ?, ?, ?)');
-                $insert->execute([$name, $sku, $category, $price]);
+                $insert = $pdo->prepare('INSERT INTO products (name, sku, category, price, supplier_id, image) VALUES (?, ?, ?, ?, ?, ?)');
+                $insert->execute([$name, $sku, $category, $price, $supplierId !== '' ? $supplierId : null, $photoName]);
                 header('Location: inventory.php?notice=product_added');
                 exit();
             } catch (PDOException $e) {
@@ -105,14 +137,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $sku = trim($_POST['sku'] ?? '');
             $category = trim($_POST['category'] ?? '');
             $price = trim($_POST['price'] ?? '0');
+            $supplierId = $_POST['supplier_id'] ?? null;
+            $photoName = uploadProductPhoto($_FILES['photo'] ?? ['name' => '']);
 
             if ($productId <= 0 || $name === '' || $sku === '') {
                 header('Location: inventory.php?error=invalid_update');
                 exit();
             }
 
-            $update = $pdo->prepare('UPDATE products SET name = ?, sku = ?, category = ?, price = ? WHERE id = ?');
-            $update->execute([$name, $sku, $category, $price, $productId]);
+            $current = $pdo->prepare('SELECT image FROM products WHERE id = ?');
+            $current->execute([$productId]);
+            $existingPhoto = $current->fetchColumn();
+
+            if ($photoName !== null) {
+                $update = $pdo->prepare('UPDATE products SET name = ?, sku = ?, category = ?, price = ?, supplier_id = ?, image = ? WHERE id = ?');
+                $update->execute([$name, $sku, $category, $price, $supplierId !== '' ? $supplierId : null, $photoName, $productId]);
+                if ($existingPhoto && $existingPhoto !== $photoName && file_exists(__DIR__ . '/uploads/' . $existingPhoto)) {
+                    unlink(__DIR__ . '/uploads/' . $existingPhoto);
+                }
+            } else {
+                $update = $pdo->prepare('UPDATE products SET name = ?, sku = ?, category = ?, price = ?, supplier_id = ? WHERE id = ?');
+                $update->execute([$name, $sku, $category, $price, $supplierId !== '' ? $supplierId : null, $productId]);
+            }
+
             header('Location: inventory.php?notice=product_updated');
             exit();
         }
@@ -125,6 +172,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $productId = (int)($_POST['product_id'] ?? 0);
             if ($productId > 0) {
+                $productInfo = $pdo->prepare('SELECT image FROM products WHERE id = ?');
+                $productInfo->execute([$productId]);
+                $photo = $productInfo->fetchColumn();
+                if ($photo && file_exists(__DIR__ . '/uploads/' . $photo)) {
+                    unlink(__DIR__ . '/uploads/' . $photo);
+                }
                 $pdo->prepare('DELETE FROM products WHERE id = ?')->execute([$productId]);
                 header('Location: inventory.php?notice=product_deleted');
                 exit();
@@ -328,8 +381,6 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
             color: white;
         }
 
-        .primary-btn:hover { filter: brightness(1.03); }
-
         .secondary-btn {
             background: #e2e8f0;
             color: var(--text);
@@ -338,6 +389,34 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
         .danger-btn {
             background: var(--danger);
             color: white;
+        }
+
+        .action-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 18px;
+        }
+
+        .action-row a, .action-row button {
+            display: inline-block;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 13px;
+        }
+
+        .export-btn {
+            background: #0f766e;
+            color: white;
+            text-decoration: none;
+            font-weight: 700;
+        }
+
+        .supplier-btn {
+            background: #e0f2fe;
+            color: #075985;
+            text-decoration: none;
+            font-weight: 700;
         }
 
         .filter-bar {
@@ -402,6 +481,15 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
         .stock-low { background: #fef3c7; color: #92400e; }
         .stock-zero { background: #fee2e2; color: #991b1b; }
 
+        .product-thumb {
+            width: 42px;
+            height: 42px;
+            object-fit: cover;
+            border-radius: 10px;
+            border: 1px solid var(--line);
+            background: #f8fafc;
+        }
+
         .actions {
             display: flex;
             gap: 8px;
@@ -421,7 +509,6 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
         .small-btn.delete { background: #fee2e2; color: #b91c1c; }
 
         .muted { color: var(--muted); }
-        .hide { display: none; }
 
         @media (max-width: 980px) {
             .grid { grid-template-columns: 1fr; }
@@ -435,8 +522,8 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
         <div class="topbar-inner">
             <div class="brand">Inventory Pro</div>
             <nav class="nav">
-                <a href="dashboard.php" class="active">Dashboard</a>
-                <a href="inventory.php">Inventory</a>
+                <a href="dashboard.php">Dashboard</a>
+                <a href="inventory.php" class="active">Inventory</a>
                 <a href="reports.php">Reports</a>
             </nav>
             <div class="user-pill"><?php echo htmlspecialchars($username); ?> • <?php echo htmlspecialchars($userRole); ?></div>
@@ -452,17 +539,32 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
             <div class="notice error"><?php echo htmlspecialchars(str_replace('_', ' ', $error)); ?></div>
         <?php endif; ?>
 
+        <div class="action-row">
+            <a href="suppliers.php" class="supplier-btn">Manage Suppliers</a>
+            <a href="export_csv.php" class="export-btn">Export CSV</a>
+            <a href="export_pdf.php" class="export-btn" target="_blank">Export PDF</a>
+        </div>
+
         <div class="grid">
             <section class="card">
                 <h2>Add New Product</h2>
-                <form method="POST" class="form-grid">
+                <form method="POST" class="form-grid" enctype="multipart/form-data">
                     <input type="hidden" name="action" value="add_product">
                     <input type="text" name="name" placeholder="Product name" required>
                     <div class="input-row">
                         <input type="text" name="sku" placeholder="SKU" required>
                         <input type="text" name="category" placeholder="Category">
                     </div>
-                    <input type="number" name="price" step="0.01" min="0" placeholder="Unit price">
+                    <div class="input-row">
+                        <input type="number" name="price" step="0.01" min="0" placeholder="Unit price">
+                        <select name="supplier_id">
+                            <option value="">Select supplier</option>
+                            <?php foreach ($suppliers as $supplier): ?>
+                                <option value="<?php echo (int)$supplier['id']; ?>"><?php echo htmlspecialchars($supplier['name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <input type="file" name="photo" accept="image/*">
                     <?php if ($canManageProducts): ?>
                         <button type="submit" class="primary-btn">Add Product</button>
                     <?php else: ?>
@@ -533,8 +635,10 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
                 <table>
                     <thead>
                         <tr>
+                            <th>Photo</th>
                             <th>Product</th>
                             <th>SKU</th>
+                            <th>Supplier</th>
                             <th>Category</th>
                             <th>Price</th>
                             <th>Stock</th>
@@ -551,15 +655,23 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
                                     elseif ($stock <= 5) $stockClass = 'stock-low';
                                 ?>
                                 <tr>
+                                    <td>
+                                        <?php if (!empty($product['image']) && file_exists(__DIR__ . '/uploads/' . $product['image'])): ?>
+                                            <img class="product-thumb" src="uploads/<?php echo htmlspecialchars($product['image']); ?>" alt="<?php echo htmlspecialchars($product['name']); ?>">
+                                        <?php else: ?>
+                                            <div class="product-thumb" style="display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:10px;">N/A</div>
+                                        <?php endif; ?>
+                                    </td>
                                     <td><?php echo htmlspecialchars($product['name']); ?></td>
                                     <td><?php echo htmlspecialchars($product['sku']); ?></td>
+                                    <td><?php echo htmlspecialchars($product['supplier_name'] ?: '-'); ?></td>
                                     <td><?php echo htmlspecialchars($product['category'] ?: '-'); ?></td>
                                     <td>$<?php echo number_format((float)$product['price'], 2); ?></td>
                                     <td><span class="stock-badge <?php echo $stockClass; ?>"><?php echo $stock; ?></span></td>
                                     <td>
                                         <div class="actions">
                                             <?php if ($canManageProducts): ?>
-                                                <button type="button" class="small-btn edit" onclick="loadEditForm(<?php echo (int)$product['id']; ?>, '<?php echo addslashes(htmlspecialchars($product['name'], ENT_QUOTES)); ?>', '<?php echo addslashes(htmlspecialchars($product['sku'], ENT_QUOTES)); ?>', '<?php echo addslashes(htmlspecialchars($product['category'] ?: '', ENT_QUOTES)); ?>', '<?php echo number_format((float)$product['price'], 2, '.', ''); ?>')">Edit</button>
+                                                <button type="button" class="small-btn edit" onclick="loadEditForm(<?php echo (int)$product['id']; ?>, '<?php echo addslashes(htmlspecialchars($product['name'], ENT_QUOTES)); ?>', '<?php echo addslashes(htmlspecialchars($product['sku'], ENT_QUOTES)); ?>', '<?php echo addslashes(htmlspecialchars($product['category'] ?: '', ENT_QUOTES)); ?>', '<?php echo number_format((float)$product['price'], 2, '.', ''); ?>', '<?php echo (int)($product['id']); ?>')">Edit</button>
                                             <?php endif; ?>
                                             <?php if ($canDeleteProducts): ?>
                                                 <form method="POST" onsubmit="return confirm('Delete this product?');" style="display:inline;">
@@ -574,7 +686,7 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
                             <?php endforeach; ?>
                         <?php else: ?>
                             <tr>
-                                <td colspan="6" class="muted">No products match your search.</td>
+                                <td colspan="8" class="muted">No products match your search.</td>
                             </tr>
                         <?php endif; ?>
                     </tbody>
@@ -586,7 +698,7 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
     <div id="editModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.45); display:flex; align-items:center; justify-content:center; z-index:50;">
         <div style="background:#fff; width:min(520px, 92vw); border-radius:18px; padding:24px; box-shadow:var(--shadow);">
             <h3 style="margin-top:0;">Edit Product</h3>
-            <form method="POST" class="form-grid">
+            <form method="POST" class="form-grid" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="update_product">
                 <input type="hidden" name="product_id" id="edit_product_id">
                 <input type="text" name="name" id="edit_name" required>
@@ -594,7 +706,16 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
                     <input type="text" name="sku" id="edit_sku" required>
                     <input type="text" name="category" id="edit_category">
                 </div>
-                <input type="number" name="price" step="0.01" min="0" id="edit_price">
+                <div class="input-row">
+                    <input type="number" name="price" step="0.01" min="0" id="edit_price">
+                    <select name="supplier_id" id="edit_supplier_id">
+                        <option value="">Select supplier</option>
+                        <?php foreach ($suppliers as $supplier): ?>
+                            <option value="<?php echo (int)$supplier['id']; ?>"><?php echo htmlspecialchars($supplier['name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <input type="file" name="photo" accept="image/*">
                 <div class="actions">
                     <button type="submit" class="primary-btn">Save Changes</button>
                     <button type="button" class="secondary-btn" onclick="closeEditModal()">Cancel</button>
@@ -604,12 +725,13 @@ $transactions = $pdo->query("SELECT st.*, p.name AS product_name FROM stock_tran
     </div>
 
     <script>
-        function loadEditForm(id, name, sku, category, price) {
+        function loadEditForm(id, name, sku, category, price, supplierId) {
             document.getElementById('edit_product_id').value = id;
             document.getElementById('edit_name').value = name;
             document.getElementById('edit_sku').value = sku;
             document.getElementById('edit_category').value = category;
             document.getElementById('edit_price').value = price;
+            document.getElementById('edit_supplier_id').value = supplierId;
             document.getElementById('editModal').style.display = 'flex';
         }
 
